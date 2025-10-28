@@ -8,9 +8,28 @@ import time
 import os
 import math
 import csv
+import random
+import numpy as np
 
 # Assuming the vit.py file (which contains the create_vit_tiny... function) is in the 'models' directory
 from models.vit import create_vit_tiny_patch4_32
+
+def fix_seed(seed: int = 42):
+    """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Make CuDNN deterministic (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Some dataloader behavior
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # For CUDA >=10.2
+
+    print(f"[Seed fixed to {seed}]")
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
@@ -34,9 +53,9 @@ def main():
     """
     # --- IDENTICAL CONFIGURATION AS main.py for VisionBDH ---
     EPOCHS = 50
-    BATCH_SIZE = 32
-    INITIAL_LR = 1e-4
-    WARMUP_STEPS = 500
+    BATCH_SIZE = 64
+    INITIAL_LR = 2e-4
+    WARMUP_STEPS = 1000
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -71,15 +90,15 @@ def main():
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
-    
-    full_train_dataset = CIFAR10(root="./data", train=True, download=True, transform=train_transform)
-    
+
+    full_train_dataset = CIFAR10(root="/home/sunghyun/bdh-vision/data", train=True, download=True, transform=train_transform)
+
     train_size = int((1 - VALIDATION_SPLIT) * len(full_train_dataset))
     val_size = len(full_train_dataset) - train_size
     train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
-    
-    test_dataset = CIFAR10(root="./data", train=False, download=True, transform=val_test_transform)
-    
+
+    test_dataset = CIFAR10(root="/home/sunghyun/bdh-vision/data", train=False, download=True, transform=val_test_transform)
+
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
@@ -164,7 +183,11 @@ def main():
             'val_accuracy': val_accuracy
         }, checkpoint_path)
         print(f"✓ Checkpoint saved to {checkpoint_path}")
-        
+        # remove old checkpoints to save space
+        if epoch > 0:
+            old_checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch-1}.pth')
+            if os.path.exists(old_checkpoint_path):
+                os.remove(old_checkpoint_path)
     print("\n" + "=" * 60)
     print("     Training Finished")
     print("=" * 60)
@@ -197,4 +220,5 @@ def main():
 
 
 if __name__ == "__main__":
+    fix_seed(42)
     main()

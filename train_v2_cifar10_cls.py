@@ -1,28 +1,18 @@
-# train_v2.py
-"""
-Train Vision-BDH v2 for 30 epochs with torch.compile() enabled.
-This version introduces minor architectural and training refinements for Vision-BDH v2:
-- Improved numerical stability (no softmax, emergent linear attention preserved)
-- Better GPU precision and scheduling
-- Structured logging for experiment tracking
-"""
-
+# train_v2_cifar10_cls.py
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
-import time
+import os, math, time, csv
 import argparse
-import os
 import glob
-import math
-import csv
 import random
 import numpy as np
+
 from models.bdh import BDHConfig
-from models.vision_bdh_v2 import VisionBDHv2
+from models.vision_bdh_v2_cls import VisionBDHv2CLS  # << use CLS variant
 
 def fix_seed(seed: int = 42):
     """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
@@ -41,7 +31,6 @@ def fix_seed(seed: int = 42):
 
     print(f"[Seed fixed to {seed}]")
 
-
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     """
     Creates a learning rate schedule with linear warmup followed by cosine decay.
@@ -54,11 +43,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
-
 def main(args):
-    """
-    Train Vision-BDH v2 on CIFAR-10 with improved stability and precision.
-    """
     # --- Configuration ---
     EPOCHS = 50
     BATCH_SIZE = 64
@@ -67,7 +52,7 @@ def main(args):
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    CHECKPOINT_DIR = "./checkpoints_v2_cifar10"
+    CHECKPOINT_DIR = "./checkpoints_v2_cifar10_cls"
     LOG_FILE = os.path.join(CHECKPOINT_DIR, "metrics_v2_cifar10.csv")
     MLP_MULTIPLIER = 32
 
@@ -84,15 +69,23 @@ def main(args):
     print(f"Device: {DEVICE}")
     print("=" * 70)
 
-    # --- Model Configuration ---
+    # BDH config kept aligned with repo's v2 runs (embedding 192, patch 4)
     config = BDHConfig(
         n_layer=6,
         n_embd=192,
-        n_head=6,
+        n_head=6,                        # as used in the repo's v2 training
         vocab_size=256,
-        mlp_internal_dim_multiplier=MLP_MULTIPLIER
+        mlp_internal_dim_multiplier=32,  # as in train_v2_cifar10.py
+        dropout=0.1
     )
-    model = VisionBDHv2(bdh_config=config, img_size=32, patch_size=4, num_classes=10)
+
+    model = VisionBDHv2CLS(
+        bdh_config=config,
+        img_size=32,
+        patch_size=4,
+        num_classes=10,
+        use_softmax_attn=True
+    )
 
     # --- Model Compilation ---
     print("\nCompiling Vision-BDH v2...")
@@ -164,6 +157,7 @@ def main(args):
     print("\n" + "=" * 70)
     print("     Starting Training Loop (v2)")
     print("=" * 70 + "\n")
+
 
     # Initialize metrics log
     if start_epoch == 0:
@@ -239,6 +233,7 @@ def main(args):
             old_checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch-1}.pth')
             if os.path.exists(old_checkpoint_path):
                 os.remove(old_checkpoint_path)
+
     # --- Final Evaluation ---
     print("\n" + "=" * 70)
     print("     Final Evaluation on Test Set (Best Checkpoint)")

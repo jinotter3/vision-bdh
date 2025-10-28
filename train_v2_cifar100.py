@@ -19,9 +19,28 @@ import os
 import glob
 import math
 import csv
+import random
+import numpy as np
 
 from models.bdh import BDHConfig
 from models.vision_bdh_v2 import VisionBDHv2
+
+def fix_seed(seed: int = 42):
+    """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Make CuDNN deterministic (slower but reproducible)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Some dataloader behavior
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # For CUDA >=10.2
+
+    print(f"[Seed fixed to {seed}]")
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
@@ -43,8 +62,8 @@ def main(args):
     """
     # --- Configuration ---
     EPOCHS = 50
-    BATCH_SIZE = 32
-    INITIAL_LR = 1e-4
+    BATCH_SIZE = 128
+    INITIAL_LR = 4e-4
     WARMUP_STEPS = 1000
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
@@ -216,6 +235,11 @@ def main(args):
         }, checkpoint_path)
         print(f"✓ Checkpoint saved: {checkpoint_path}\n")
 
+        # remove old checkpoints to save space
+        if epoch > 0:
+            old_checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch-1}.pth')
+            if os.path.exists(old_checkpoint_path):
+                os.remove(old_checkpoint_path)
     # --- Final Evaluation ---
     print("\n" + "=" * 70)
     print("     Final Evaluation on Test Set (Best Checkpoint)")
@@ -256,5 +280,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train VisionBDH v2 on CIFAR-100")
     parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization")
     args = parser.parse_args()
+    fix_seed(args.seed)
     main(args)
