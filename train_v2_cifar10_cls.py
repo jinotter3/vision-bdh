@@ -52,7 +52,7 @@ def main(args):
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    CHECKPOINT_DIR = "./checkpoints_v2_cifar10_cls"
+    CHECKPOINT_DIR = "./checkpoints_v2_cifar10_cls_nosoftmax_v2"
     LOG_FILE = os.path.join(CHECKPOINT_DIR, "metrics_v2_cifar10.csv")
     MLP_MULTIPLIER = 32
 
@@ -84,7 +84,7 @@ def main(args):
         img_size=32,
         patch_size=4,
         num_classes=10,
-        use_softmax_attn=True
+        use_softmax_attn=False
     )
 
     # --- Model Compilation ---
@@ -122,6 +122,7 @@ def main(args):
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
+        # transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
         transforms.ToTensor(),
         transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
@@ -174,8 +175,9 @@ def main(args):
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             optimizer.zero_grad()
-            logits = model(images)
-            loss = loss_fn(logits, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(images)
+                loss = loss_fn(logits, labels)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
 

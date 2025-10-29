@@ -61,6 +61,7 @@ class BidirectionalAttentionV2(nn.Module):
         if self.use_softmax:
             scores = F.softmax(scores / (Q.size(-1) ** 0.5), dim=-1)
 
+        V = V.expand(-1, self.config.n_head, -1, -1) 
         return scores @ V  # (B, nh, T, D)
 
 

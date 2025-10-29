@@ -1,28 +1,19 @@
-# train_v2.py
-"""
-Train Vision-BDH v2 for 30 epochs with torch.compile() enabled.
-This version introduces minor architectural and training refinements for Vision-BDH v2:
-- Improved numerical stability (no softmax, emergent linear attention preserved)
-- Better GPU precision and scheduling
-- Structured logging for experiment tracking
-"""
-
+# train_v2_cifar10_cls_optimized.py
+# Optimized training script for transformer-level speed
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torchvision.datasets import CIFAR10
 from torchvision import transforms
 from torch.utils.data import DataLoader, random_split
-import time
+import os, math, time, csv
 import argparse
-import os
 import glob
-import math
-import csv
 import random
 import numpy as np
+
 from models.bdh import BDHConfig
-from models.vision_bdh_v2 import VisionBDHv2
+from models.vision_bdh_v2_cls_optimized import VisionBDHv2CLSOptimized
 
 def fix_seed(seed: int = 42):
     """Set random seed for reproducibility across Python, NumPy, and PyTorch."""
@@ -41,7 +32,6 @@ def fix_seed(seed: int = 42):
 
     print(f"[Seed fixed to {seed}]")
 
-
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
     """
     Creates a learning rate schedule with linear warmup followed by cosine decay.
@@ -54,58 +44,77 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch)
 
-
 def main(args):
-    """
-    Train Vision-BDH v2 on CIFAR-10 with improved stability and precision.
-    """
     # --- Configuration ---
     EPOCHS = 50
-    BATCH_SIZE = 64
+    BATCH_SIZE = 128  # Increased from 64 for better GPU utilization
+    GRAD_ACCUM_STEPS = 2  # Effective batch size = 256
     INITIAL_LR = 2e-4
     WARMUP_STEPS = 1000
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    CHECKPOINT_DIR = "./checkpoints_v2_cifar10_nosoftmax_bf16"
+    CHECKPOINT_DIR = "./checkpoints_v2_cifar10_cls_optimized"
     LOG_FILE = os.path.join(CHECKPOINT_DIR, "metrics_v2_cifar10.csv")
-    MLP_MULTIPLIER = 32
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-    # GPU performance tweaks
+    # GPU performance tweaks - more aggressive
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
+    
+    # Enable cudnn benchmark for faster convolutions (set to True for speed)
+    if not args.deterministic:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
 
     print("=" * 70)
-    print("     Training Vision-BDH v2 (MLP Multiplier = 32, 30 Epochs)")
+    print("     Training Vision-BDH v2 OPTIMIZED")
     print("=" * 70)
     print(f"Device: {DEVICE}")
+    print(f"Batch Size: {BATCH_SIZE} x {GRAD_ACCUM_STEPS} accum = {BATCH_SIZE * GRAD_ACCUM_STEPS} effective")
     print("=" * 70)
 
-    # --- Model Configuration ---
+    # BDH config
     config = BDHConfig(
         n_layer=6,
         n_embd=192,
         n_head=6,
         vocab_size=256,
-        mlp_internal_dim_multiplier=MLP_MULTIPLIER
+        mlp_internal_dim_multiplier=32,
+        dropout=0.1
     )
-    model = VisionBDHv2(bdh_config=config, img_size=32, patch_size=4, num_classes=10, use_softmax_attn=False)
 
-    # --- Model Compilation ---
-    print("\nCompiling Vision-BDH v2...")
+    model = VisionBDHv2CLSOptimized(
+        bdh_config=config,
+        img_size=32,
+        patch_size=4,
+        num_classes=10,
+        use_softmax_attn=False
+    )
+
+    # Convert patch_embed to channels_last for better conv performance
+    model.patch_embed = model.patch_embed.to(memory_format=torch.channels_last)
+
+    # --- Model Compilation with inductor (more aggressive) ---
+    print("\nCompiling Vision-BDH v2 with inductor backend...")
     try:
-        backend_choice = "aot_eager"
-        model = torch.compile(model, backend=backend_choice)
-        print(f"✓ Model compiled successfully (backend: {backend_choice}).")
+        # Use inductor backend for best performance (PyTorch 2.0+)
+        model = torch.compile(model, mode="max-autotune", backend="inductor")
+        print(f"✓ Model compiled successfully with inductor backend.")
     except Exception as e:
-        print(f"⚠️ Warning: Compilation failed, continuing without it. Error: {e}")
+        print(f"⚠️ Warning: Inductor compilation failed, trying default...")
+        try:
+            model = torch.compile(model)
+            print(f"✓ Model compiled with default backend.")
+        except Exception as e2:
+            print(f"⚠️ Warning: Compilation failed, continuing without it. Error: {e2}")
 
     model.to(DEVICE)
 
-    optimizer = AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=0.05)
+    # Use fused AdamW for better performance
+    optimizer = AdamW(model.parameters(), lr=INITIAL_LR, weight_decay=0.05, fused=True)
 
     # --- Resume Logic ---
     start_epoch = 0
@@ -125,7 +134,7 @@ def main(args):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"\nModel created with {num_params / 1e6:.2f}M trainable parameters.\n")
 
-    # --- Data Preparation ---
+    # --- Data Preparation with optimizations ---
     train_transform = transforms.Compose([
         transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
         transforms.RandomHorizontalFlip(),
@@ -144,14 +153,37 @@ def main(args):
     train_dataset, val_dataset = random_split(full_train_dataset, [train_size, val_size])
     test_dataset = CIFAR10(root="/home/sunghyun/bdh-vision/data", train=False, download=True, transform=val_test_transform)
 
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    # Optimized DataLoader settings
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True, 
+        num_workers=4,  # Increased from 2
+        pin_memory=True,
+        prefetch_factor=2,  # Prefetch batches
+        persistent_workers=True  # Keep workers alive
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=BATCH_SIZE * 2,  # Larger batch for validation
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True,
+        prefetch_factor=2,
+        persistent_workers=True
+    )
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=BATCH_SIZE * 2, 
+        shuffle=False, 
+        num_workers=4,
+        pin_memory=True
+    )
 
     print(f"Dataset loaded: Train={len(train_dataset)}, Val={len(val_dataset)}, Test={len(test_dataset)}")
 
     # --- Scheduler ---
-    num_training_steps = EPOCHS * len(train_loader)
+    num_training_steps = EPOCHS * len(train_loader) // GRAD_ACCUM_STEPS
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=WARMUP_STEPS,
@@ -159,10 +191,11 @@ def main(args):
     )
 
     loss_fn = nn.CrossEntropyLoss()
+    scaler = torch.cuda.amp.GradScaler()  # For mixed precision training
 
     # --- Training ---
     print("\n" + "=" * 70)
-    print("     Starting Training Loop (v2)")
+    print("     Starting Training Loop (OPTIMIZED)")
     print("=" * 70 + "\n")
 
     # Initialize metrics log
@@ -175,26 +208,44 @@ def main(args):
         epoch_start_time = time.time()
         model.train()
         total_loss = 0
+        
+        # Set zero_grad before loop (more efficient than calling each iteration)
+        optimizer.zero_grad(set_to_none=True)
 
         for i, (images, labels) in enumerate(train_loader):
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
+            # Use channels_last for input as well
+            images = images.to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
+            labels = labels.to(DEVICE, non_blocking=True)
 
-            optimizer.zero_grad()
+            # Mixed precision training
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = model(images)
                 loss = loss_fn(logits, labels)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                loss = loss / GRAD_ACCUM_STEPS  # Scale loss for gradient accumulation
+            
+            # Backward pass
+            scaler.scale(loss).backward()
 
-            optimizer.step()
-            scheduler.step()
+            # Update weights every GRAD_ACCUM_STEPS
+            if (i + 1) % GRAD_ACCUM_STEPS == 0:
+                # Gradient clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                
+                # Optimizer step
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                
+                # Zero gradients for next accumulation
+                optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item()
+            total_loss += loss.item() * GRAD_ACCUM_STEPS
 
             if (i + 1) % 100 == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 print(f"  Epoch {epoch+1}/{EPOCHS}, Batch {i+1}/{len(train_loader)}, "
-                      f"Loss: {loss.item():.4f}, LR: {current_lr:.6f}")
+                      f"Loss: {loss.item() * GRAD_ACCUM_STEPS:.4f}, LR: {current_lr:.6f}")
 
         avg_train_loss = total_loss / len(train_loader)
 
@@ -204,8 +255,12 @@ def main(args):
         total = 0
         with torch.no_grad():
             for images, labels in val_loader:
-                images, labels = images.to(DEVICE), labels.to(DEVICE)
-                logits = model(images)
+                images = images.to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
+                labels = labels.to(DEVICE, non_blocking=True)
+                
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(images)
+                
                 preds = torch.argmax(logits, dim=1)
                 total += labels.size(0)
                 correct += (preds == labels).sum().item()
@@ -225,21 +280,24 @@ def main(args):
             writer = csv.writer(f)
             writer.writerow([epoch + 1, avg_train_loss, val_accuracy, epoch_time, scheduler.get_last_lr()[0]])
 
-        # --- Save Checkpoint ---
-        checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch}.pth')
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_accuracy': val_accuracy
-        }, checkpoint_path)
-        print(f"✓ Checkpoint saved: {checkpoint_path}\n")
+        # --- Save Checkpoint (less frequently to save time) ---
+        if (epoch + 1) % 5 == 0 or epoch == EPOCHS - 1:
+            checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch}.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_accuracy': val_accuracy
+            }, checkpoint_path)
+            print(f"✓ Checkpoint saved: {checkpoint_path}\n")
 
-        # remove old checkpoints to save space
-        if epoch > 0:
-            old_checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{epoch-1}.pth')
-            if os.path.exists(old_checkpoint_path):
-                os.remove(old_checkpoint_path)
+            # Remove old checkpoints to save space (keep every 5th and last)
+            for old_epoch in range(max(0, epoch - 10), epoch):
+                if old_epoch % 5 != 0:
+                    old_checkpoint_path = os.path.join(CHECKPOINT_DIR, f'checkpoint_epoch_{old_epoch}.pth')
+                    if os.path.exists(old_checkpoint_path):
+                        os.remove(old_checkpoint_path)
+
     # --- Final Evaluation ---
     print("\n" + "=" * 70)
     print("     Final Evaluation on Test Set (Best Checkpoint)")
@@ -263,8 +321,12 @@ def main(args):
     total = 0
     with torch.no_grad():
         for images, labels in test_loader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
-            logits = model(images)
+            images = images.to(DEVICE, non_blocking=True, memory_format=torch.channels_last)
+            labels = labels.to(DEVICE, non_blocking=True)
+            
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(images)
+            
             preds = torch.argmax(logits, dim=1)
             total += labels.size(0)
             correct += (preds == labels).sum().item()
@@ -278,9 +340,20 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train VisionBDH v2 on CIFAR-10")
+    parser = argparse.ArgumentParser(description="Train VisionBDH v2 (Optimized) on CIFAR-10")
     parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for initialization")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic algorithms (slower but reproducible)")
     args = parser.parse_args()
-    fix_seed(args.seed)
+    
+    if args.deterministic:
+        fix_seed(args.seed)
+    else:
+        # Still set seed but allow non-deterministic ops for speed
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        print(f"[Seed set to {args.seed} (non-deterministic mode for speed)]")
+    
     main(args)

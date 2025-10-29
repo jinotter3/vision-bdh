@@ -51,6 +51,7 @@ checkpoints_v1_cifar10/
 checkpoints_v2_cifar10/
 checkpoints_v2_cifar10_cls/
 checkpoints_vit_tiny_cifar10/
+checkpoints_*
 
 checkpoints_ablation_nogating_cifar100/
 

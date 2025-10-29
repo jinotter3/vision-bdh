@@ -59,7 +59,7 @@ def main():
     GRAD_CLIP = 1.0
     VALIDATION_SPLIT = 0.2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    CHECKPOINT_DIR = "./checkpoints_vit_tiny_cifar10"
+    CHECKPOINT_DIR = "./checkpoints_vit_tiny_cifar10_bf16"
     LOG_FILE = os.path.join(CHECKPOINT_DIR, "metrics_vit_tiny_cifar10.csv")
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -130,8 +130,9 @@ def main():
             images, labels = images.to(DEVICE), labels.to(DEVICE)
 
             optimizer.zero_grad()
-            logits = model(images)
-            loss = loss_fn(logits, labels)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(images)
+                loss = loss_fn(logits, labels)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
